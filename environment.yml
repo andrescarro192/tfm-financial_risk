@@ -1,0 +1,24 @@
+name: tfm-financial-risk
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch>=2.3
+    - torch-geometric>=2.5
+    - torch-geometric-temporal>=0.54
+    - tabpfn>=2.0
+    - scikit-learn>=1.5
+    - pandas>=2.2
+    - numpy>=1.26
+    - shap>=0.45
+    - umap-learn>=0.5
+    - matplotlib
+    - seaborn
+    - pyyaml
+    - pytest
+    - jupyterlab

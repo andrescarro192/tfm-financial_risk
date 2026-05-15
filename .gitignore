@@ -1,0 +1,10 @@
+data/dataraw/
+data/processed/
+data/graphs/
+__pycache__/
+*.pyc
+.env
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+.DS_Store
