@@ -1,3 +1,4 @@
+'''src/data/loader.py'''
 from pathlib import Path
 import pandas as pd
 from src.utils.config import RAW_DIR, FAILURES_FILE, ENTITY_COL
@@ -13,14 +14,20 @@ def load_quarter(quarter_path: Path, file_type: str) -> pd.DataFrame:
     Carga un tipo de archivo de un trimestre concreto.
     file_type: 'FTS' | 'CDI' | 'RAT' | 'MERG' | 'STRU'
     """
-    suffix = quarter_path.name[3:]  # 'ris1603' -> '1603'
+    suffix = quarter_path.name[3:]
     filepath = quarter_path / f"{file_type}{suffix}.csv"
 
     if not filepath.exists():
         raise FileNotFoundError(f"No encontrado: {filepath}")
 
     df = pd.read_csv(filepath, low_memory=False)
-    df[ENTITY_COL] = df[ENTITY_COL].astype(str)  # CERT siempre string
+    
+    # MERG usa C_CERT como identificador principal
+    if file_type == 'MERG':
+        df['C_CERT'] = df['C_CERT'].astype(str)
+    else:
+        df[ENTITY_COL] = df[ENTITY_COL].astype(str)
+    
     return df
 
 
