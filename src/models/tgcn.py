@@ -203,7 +203,9 @@ class TGCNCell(nn.Module):
    - El número de nodos N varía entre snapshots (quiebras, fusiones).
      El estado oculto h se reinicializa a cero al principio de cada secuencia.
    - El Laplaciano L̂^t se calcula dinámicamente para cada snapshot.
-   - La cabeza clasificadora proyecta h_i^T → ŷ_i ∈ [0,1].'''
+   - La cabeza clasificadora proyecta h_i^T → ŷ_i ∈ [0,1].
+'''
+
 class TGCN(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int):
         """

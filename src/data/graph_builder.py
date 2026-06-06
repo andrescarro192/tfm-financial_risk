@@ -68,7 +68,7 @@ class GraphBuilder:
         self.labels['CERT'] = self.labels['CERT'].astype(str)
 
         # OFFDOM, OFFTOT son object (strings de enteros) — convertir
-        for col in ['OFFDOM', 'OFFTOT']:
+        for col in ['OFFDOM', 'OFFTOT','SIMS_LAT', 'SIMS_LONG']:
             self.nodos[col] = pd.to_numeric(self.nodos[col], errors='coerce')
 
         # RSSDHCR a entero nullable para comparación exacta
@@ -154,12 +154,10 @@ class GraphBuilder:
         for coord in ['SIMS_LAT', 'SIMS_LONG']:
             media_global = self._impute_stats[coord + '_global']
             media_stalp  = self._impute_stats[coord + '_stalp']
-            nodos_t[coord] = nodos_t.apply(
-                lambda row, c=coord, mg=media_global, ms=media_stalp: (
-                    ms.get(row['STALP'], mg) if pd.isna(row[c]) else row[c]
-                ),
-                axis=1
-            )
+            mask_na = nodos_t[coord].isna()
+            if mask_na.any():
+                fallback = nodos_t.loc[mask_na, 'STALP'].map(media_stalp).fillna(media_global)
+                nodos_t.loc[mask_na, coord] = fallback
 
         # OFFDOM, OFFTOT, OFFSTATE — mediana global
         for col in ['OFFDOM', 'OFFTOT', 'OFFSTATE']:
@@ -309,7 +307,7 @@ class GraphBuilder:
             output_dir / 'periodos_index.csv', header=None
         )[0].tolist()
         snapshots  = [
-            torch.load(output_dir / f'snapshot_{p}.pt')
+            torch.load(output_dir / f'snapshot_{p}.pt', weights_only=False)
             for p in periodos
         ]
         print(f'Cargados {len(snapshots)} snapshots desde {output_dir}')
