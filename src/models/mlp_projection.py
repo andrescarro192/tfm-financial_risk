@@ -1,7 +1,5 @@
 # src/models/mlp_projection.py
 """
-mlp_projection.py
-=================
 Módulo de proyección multimodal para el LSTM Autoencoder híbrido.
 
 Responsabilidad única: recibir el vector concatenado [e_tab || e_rel] ∈ ℝ^d_in

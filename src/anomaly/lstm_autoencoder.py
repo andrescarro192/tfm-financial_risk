@@ -1,6 +1,5 @@
+# src/anomaly/lstm_autoencoder.py
 """
-lstm_autoencoder.py
-===================
 Encoder LSTM, Decoder LSTM y modelo HybridLSTMAE completo para
 detección de anomalías no supervisada sobre secuencias de embeddings bancarios.
 
