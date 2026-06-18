@@ -307,13 +307,13 @@ def train_model(
             split_str = ""
             if mse_norm_mean is not None and mse_anom_mean is not None:
                 split_str = (
-                    f" | mse_norm={mse_norm_mean:.4f} mse_anom={mse_anom_mean:.4f} "
+                    f" | mse_norm={mse_norm_mean:.2e} mse_anom={mse_anom_mean:.2e} "
                     f"ratio={mse_anom_mean / mse_norm_mean:.2f}x"
                 )
             marker = " *" if improved else ""
             print(
                 f"[Epoch {epoch:3d}/{epochs}] "
-                f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
+                f"train_loss={train_loss:.2e} val_loss={val_loss:.6f} "
                 f"lr={current_lr:.2e}{split_str} "
                 f"({elapsed:.1f}s){marker}"
             )
