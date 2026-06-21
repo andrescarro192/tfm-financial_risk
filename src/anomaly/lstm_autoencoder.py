@@ -73,7 +73,7 @@ aprender únicamente los patrones estructurales de la normalidad.
 
 import torch
 import torch.nn as nn
-from src.models.mlp_projection import MLPProjection 
+from src.models.mlp_projection import MLPProjection
 
 
 # ---------------------------------------------------------------------------

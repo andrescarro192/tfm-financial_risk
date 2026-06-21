@@ -1,355 +1,346 @@
-# src/training/trainer.py
+# src/trainer.py
 """
-Bucle de entrenamiento reutilizable para HybridLSTMAE.
-
-Este módulo centraliza la lógica de entrenamiento para que sea compartida
-por tres usos distintos dentro del proyecto:
-
-    1. Búsqueda de hiperparámetros con Optuna (Bloque 4a):
-       entrenamientos cortos (pocas épocas) con pruning activo, optimizando
-       learning_rate, weight_decay y dropout sobre val_loss (MSE de
-       reconstrucción en validación, métrica NO SUPERVISADA).
-
-    2. Entrenamiento final (Bloque 4):
-       entrenamiento completo (EPOCHS=200) con los mejores hiperparámetros
-       encontrados, sin pruning.
-
-    3. Ablación (Bloque 7):
-       18 ejecuciones (3 configs arquitectónicas x 2 variantes de loss x
-       3 seeds), reutilizando esta misma función con los hiperparámetros
-       de optimización ya fijados por Optuna.
-
-Principio de diseño: completamente no supervisado
----------------------------------------------------
-La etiqueta `failed` / `is_anomalous` NUNCA participa en:
-    - el cálculo de la loss de entrenamiento,
-    - el criterio de early stopping,
-    - el scheduler,
-    - el objetivo de Optuna.
-
-Se usa EXCLUSIVAMENTE para una métrica informativa por época: la separación
-del MSE de reconstrucción entre observaciones normales y anómalas en train.
-Esta métrica no influye en ninguna decisión del entrenamiento; sirve solo
-para observar si, a medida que el modelo aprende a reconstruir la normalidad,
-el error de reconstrucción de los positivos se separa del de los negativos
-(señal de que el anomaly score será informativo en el Bloque 5).
-
-Early stopping con restauración del mejor estado
---------------------------------------------------
-Al finalizar (por agotar epochs o por early stopping), el modelo devuelto
-tiene cargados los pesos de la época con mejor val_loss, no los de la
-última época. Esto es importante porque ReduceLROnPlateau y el propio
-ruido del entrenamiento pueden hacer que val_loss empeore en las últimas
-épocas antes de detenerse.
-
-Hook de pruning para Optuna
------------------------------
-Si se pasa un objeto `trial` (de Optuna), tras cada época se reporta
-val_loss mediante `trial.report(val_loss, epoch)` y se consulta
-`trial.should_prune()`. Si el trial debe podarse, se lanza
-`optuna.TrialPruned()`.
-
-El import de `optuna` es perezoso (solo ocurre si `trial is not None`),
-de forma que este módulo no requiere optuna instalado para los usos 2 y 3
-(entrenamiento final y ablación), que no pasan ningún trial.
+Funciones de entrenamiento, evaluación y early stopping, agnósticas al
+modelo concreto (reciben model como argumento). Reutilizables sin cambios
+para el Baseline y para el futuro Híbrido, ya que ambos comparten la
+misma arquitectura y el mismo protocolo de entrenamiento.
 """
-
-import copy
-import time
-from typing import Optional, Any
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-
-from src.anomaly.losses import TemporalWeightedLoss
-
-
-# ---------------------------------------------------------------------------
-# Helpers internos
-# ---------------------------------------------------------------------------
-
-def _make_eval_criterion(criterion: TemporalWeightedLoss) -> TemporalWeightedLoss:
-    """
-    Construye una copia de `criterion` con reduction='none', reutilizando
-    los mismos pesos temporales y el mismo modo (uniforme/ponderado).
-
-    Se usa para calcular el MSE por muestra (sin reducir sobre el batch),
-    necesario para separar positivos de negativos en la métrica informativa
-    de cada época. El criterio principal de entrenamiento usa
-    reduction='mean' para el backward; este auxiliar no se usa para
-    backpropagation.
-    """
-    if criterion.use_temporal_weighting and criterion.weights_logical is not None:
-        weights = criterion.weights_logical.tolist()
-    else:
-        weights = None
-
-    return TemporalWeightedLoss(
-        weights=weights,
-        use_temporal_weighting=criterion.use_temporal_weighting,
-        reduction="none",
-    )
+from sklearn.metrics import average_precision_score, roc_auc_score
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
-def _run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: TemporalWeightedLoss,
-    device: str,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    criterion_eval: Optional[TemporalWeightedLoss] = None,
-) -> dict[str, Any]:
-    """
-    Ejecuta una pasada completa sobre `loader`.
-
-    Si `optimizer` no es None, se asume modo entrenamiento: el modelo se
-    pone en train(), se calcula backward y se actualizan los pesos.
-    Si `optimizer` es None, se asume modo evaluación: model.eval() y
-    torch.no_grad().
-
-    Si `criterion_eval` (reduction='none') se proporciona, además del
-    loss agregado se acumulan los MSE por muestra junto con la máscara
-    `is_anomalous`, para la métrica informativa de separación.
-
-    Retorna
-    -------
-    dict con:
-        'loss': float, loss promedio (ponderado por nº de muestras) sobre el loader.
-        'mse_normales': list[float] o None
-        'mse_anomalos': list[float] o None
-    """
-    is_training = optimizer is not None
-    model.train(mode=is_training)
-
+def train_one_epoch(model, loader, optimizer, criterion, clip_norm, device):
+    model.train()
     total_loss = 0.0
-    total_samples = 0
+    n_obs = 0
+    for batch in loader:
+        x = batch["X"].to(device)
+        y = batch["failed"].to(device)
 
-    mse_normales: list[float] = []
-    mse_anomalos: list[float] = []
-    collect_split = criterion_eval is not None
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+        optimizer.step()
 
-    context = torch.enable_grad() if is_training else torch.no_grad()
+        total_loss += loss.item() * x.size(0)
+        n_obs += x.size(0)
 
-    with context:
-        for batch in loader:
-            x = batch["X"].to(device)
-            batch_size = x.size(0)
-
-            e_proj, x_hat = model(x)
-            loss = criterion(e_proj, x_hat)
-
-            if is_training:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
-
-            if collect_split:
-                # mse_per_sample: (batch,) con reduction='none'
-                mse_per_sample = criterion_eval(e_proj, x_hat)
-                is_anom = batch["is_anomalous"].to(device)
-
-                mse_np = mse_per_sample.detach().cpu()
-                anom_np = is_anom.detach().cpu()
-
-                mse_normales.extend(mse_np[~anom_np].tolist())
-                mse_anomalos.extend(mse_np[anom_np].tolist())
-
-    return {
-        "loss": total_loss / total_samples,
-        "mse_normales": mse_normales if collect_split else None,
-        "mse_anomalos": mse_anomalos if collect_split else None,
-    }
+    return total_loss / n_obs
 
 
-# ---------------------------------------------------------------------------
-# Función principal
-# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    """
+    Evalúa sobre el split completo, no por batch. Necesario porque con
+    pocos positivos repartidos en muchos batches, una métrica de ranking
+    calculada batch a batch no tiene sentido estadístico: hay que
+    concatenar logits y targets de todo el split antes de calcular
+    AUC-PR/AUC-ROC.
+    """
+    model.eval()
+    total_loss = 0.0
+    n_obs = 0
+    all_logits, all_targets = [], []
 
-def train_model(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    criterion: TemporalWeightedLoss,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device: str,
-    epochs: int,
-    patience_early_stopping: int,
-    patience_scheduler: int,
-    factor_scheduler: float,
-    trial: Optional[Any] = None,
+    for batch in loader:
+        x = batch["X"].to(device)
+        y = batch["failed"].to(device)
+
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        total_loss += loss.item() * x.size(0)
+        n_obs += x.size(0)
+        all_logits.append(logits.cpu())
+        all_targets.append(y.cpu())
+
+    all_logits = torch.cat(all_logits)
+    all_targets = torch.cat(all_targets)
+    probs = torch.sigmoid(all_logits).numpy()
+    targets = all_targets.numpy()
+
+    auc_pr = average_precision_score(targets, probs)
+    auc_roc = roc_auc_score(targets, probs)
+
+    return total_loss / n_obs, auc_pr, auc_roc
+
+
+def train_with_early_stopping(
+    model,
+    dataloader_train,
+    dataloader_val,
+    pos_weight_raw: float,
+    pw_factor: float = 1.0,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    clip_norm: float = 1.0,
+    max_epochs: int = 100,
+    patience: int = 15,
+    scheduler_factor: float = 0.5,
+    scheduler_patience: int = 5,
+    device: str = "cpu",
     verbose: bool = True,
-    log_every_n_epochs: int = 5,
-    compute_split_metric: bool = True,
-) -> dict[str, Any]:
+):
     """
-    Entrena `model` minimizando `criterion` sobre `train_loader`, evaluando
-    en `val_loader`, con scheduler ReduceLROnPlateau y early stopping sobre
-    val_loss.
+    Restauración de mejor época: se conserva una copia de los pesos cada
+    vez que val_auc_pr mejora, y al final se restaura esa copia, no los
+    pesos de la última época ejecutada.
 
-    La etiqueta `is_anomalous` no influye en loss, scheduler ni early
-    stopping. Se usa únicamente para la métrica informativa de separación
-    MSE normales vs anómalos en TRAIN (no en val, que no tiene positivos).
-
-    Parámetros
-    ----------
-    model : nn.Module
-        Instancia de HybridLSTMAE, ya movida a `device`.
-    optimizer : torch.optim.Optimizer
-        Optimizador ya construido (lr y weight_decay se fijan al crearlo,
-        por eso no son argumentos de esta función).
-    criterion : TemporalWeightedLoss
-        Loss con reduction='mean', usada para backward.
-    train_loader, val_loader : DataLoader
-    device : str
-    epochs : int
-        Número máximo de épocas.
-    patience_early_stopping : int
-        Épocas sin mejora de val_loss antes de detener el entrenamiento.
-    patience_scheduler, factor_scheduler : ReduceLROnPlateau
-        Parámetros del scheduler sobre val_loss.
-    trial : optuna.Trial | None
-        Si se proporciona, se reporta val_loss por época y se comprueba
-        pruning. Lanza optuna.TrialPruned() si el trial debe podarse.
-    verbose : bool
-    log_every_n_epochs : int
-    compute_split_metric : bool
-        Si True, calcula la separación MSE normales/anómalos en train en
-        cada época (coste adicional despreciable: una pasada con
-        reduction='none' sobre el mismo batch ya computado).
-
-    Retorna
-    -------
-    dict con:
-        'model': nn.Module — modelo con los pesos de la mejor época (val_loss mínima).
-        'best_val_loss': float
-        'best_epoch': int
-        'history': dict con listas 'train_loss', 'val_loss', 'lr',
-                   'mse_normales_mean', 'mse_anomalos_mean' (las dos
-                   últimas son None por época si compute_split_metric=False
-                   o si train no contiene anómalos en ese batch).
-        'stopped_early': bool
+    Scheduler: ReduceLROnPlateau monitoreando val_loss (no val_auc_pr).
+    val_loss es una señal continua sobre todo el split de validación;
+    val_auc_pr, con solo unos pocos positivos en val, es una señal de
+    baja resolución y poco adecuada para gobernar la reducción de
+    learning rate. scheduler_patience se fija por debajo de patience
+    (early stopping) para permitir varias reducciones de lr antes de
+    agotar la paciencia y detener el entrenamiento.
     """
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=factor_scheduler,
-        patience=patience_scheduler,
+    pos_weight_used = torch.tensor(
+        pw_factor * pos_weight_raw, dtype=torch.float32, device=device
+    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_used)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="min", factor=scheduler_factor, patience=scheduler_patience
     )
 
-    criterion_eval = _make_eval_criterion(criterion) if compute_split_metric else None
+    best_auc_pr = -float("inf")
+    best_state = None
+    epochs_sin_mejora = 0
+    history = []
 
-    best_val_loss = float("inf")
-    best_epoch = -1
-    best_state = copy.deepcopy(model.state_dict())
-    epochs_no_improve = 0
-    stopped_early = False
+    model.to(device)
 
-    history: dict[str, list] = {
-        "train_loss": [],
-        "val_loss": [],
-        "lr": [],
-        "mse_normales_mean": [],
-        "mse_anomalos_mean": [],
-    }
-
-    for epoch in range(1, epochs + 1):
-        t0 = time.time()
-
-        train_result = _run_epoch(
-            model, train_loader, criterion, device,
-            optimizer=optimizer, criterion_eval=criterion_eval,
+    for epoch in range(1, max_epochs + 1):
+        train_loss = train_one_epoch(
+            model, dataloader_train, optimizer, criterion, clip_norm, device
         )
-        val_result = _run_epoch(
-            model, val_loader, criterion, device,
-            optimizer=None, criterion_eval=None,
+        val_loss, val_auc_pr, val_auc_roc = evaluate(
+            model, dataloader_val, criterion, device
         )
 
-        train_loss = train_result["loss"]
-        val_loss = val_result["loss"]
-
+        lr_antes = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]["lr"]
+        lr_actual = optimizer.param_groups[0]["lr"]
 
-        # --- Métrica informativa: separación MSE normales/anómalos en train ---
-        mse_norm_mean = None
-        mse_anom_mean = None
-        if compute_split_metric:
-            mse_normales = train_result["mse_normales"]
-            mse_anomalos = train_result["mse_anomalos"]
-            if len(mse_normales) > 0:
-                mse_norm_mean = sum(mse_normales) / len(mse_normales)
-            if len(mse_anomalos) > 0:
-                mse_anom_mean = sum(mse_anomalos) / len(mse_anomalos)
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_auc_pr": val_auc_pr,
+            "val_auc_roc": val_auc_roc,
+            "lr": lr_actual,
+        })
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["lr"].append(current_lr)
-        history["mse_normales_mean"].append(mse_norm_mean)
-        history["mse_anomalos_mean"].append(mse_anom_mean)
-
-        # --- Early stopping sobre val_loss ---
-        improved = val_loss < best_val_loss
-        if improved:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_state = copy.deepcopy(model.state_dict())
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
-        # --- Logging ---
-        if verbose and (epoch % log_every_n_epochs == 0 or epoch == 1 or improved):
-            elapsed = time.time() - t0
-            split_str = ""
-            if mse_norm_mean is not None and mse_anom_mean is not None:
-                split_str = (
-                    f" | mse_norm={mse_norm_mean:.2e} mse_anom={mse_anom_mean:.2e} "
-                    f"ratio={mse_anom_mean / mse_norm_mean:.2f}x"
-                )
-            marker = " *" if improved else ""
-            print(
-                f"[Epoch {epoch:3d}/{epochs}] "
-                f"train_loss={train_loss:.2e} val_loss={val_loss:.6f} "
-                f"lr={current_lr:.2e}{split_str} "
-                f"({elapsed:.1f}s){marker}"
+        if verbose:
+            msg = (
+                f"Epoch {epoch:3d} | train_loss={train_loss:.4f} "
+                f"| val_loss={val_loss:.4f} | val_AUC-PR={val_auc_pr:.4f} "
+                f"| val_AUC-ROC={val_auc_roc:.4f} | lr={lr_actual:.2e}"
             )
+            if lr_actual < lr_antes:
+                msg += f"  <- lr reducido ({lr_antes:.2e} -> {lr_actual:.2e})"
+            print(msg)
 
-        # --- Hook de pruning para Optuna ---
-        if trial is not None:
-            trial.report(val_loss, epoch)
-            if trial.should_prune():
-                import optuna
-                raise optuna.TrialPruned()
+        if val_auc_pr > best_auc_pr:
+            best_auc_pr = val_auc_pr
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            epochs_sin_mejora = 0
+        else:
+            epochs_sin_mejora += 1
 
-        # --- Early stopping ---
-        if epochs_no_improve >= patience_early_stopping:
-            stopped_early = True
+        if epochs_sin_mejora >= patience:
             if verbose:
                 print(
-                    f"[EarlyStopping] Sin mejora en val_loss durante "
-                    f"{patience_early_stopping} épocas. Deteniendo en epoch {epoch}. "
-                    f"Mejor val_loss={best_val_loss:.6f} en epoch {best_epoch}."
+                    f"\nEarly stopping en epoch {epoch}: sin mejora en "
+                    f"val_AUC-PR durante {patience} epochs."
                 )
             break
 
-    # Restaurar los pesos de la mejor época
     model.load_state_dict(best_state)
+    return model, history, best_auc_pr
 
-    if verbose:
-        status = "early stopping" if stopped_early else "epochs agotados"
-        print(
-            f"[train_model] Finalizado ({status}). "
-            f"best_val_loss={best_val_loss:.6f} en epoch {best_epoch}."
+
+
+def plot_training_history(history: list, title: str = "Entrenamiento LSTM Baseline") -> None:
+    """
+    Grafica train_loss/val_loss y val_AUC-PR/val_AUC-ROC por epoch.
+    Marca con línea vertical el epoch de mejor val_AUC-PR, que es el que
+    train_with_early_stopping usa para restaurar los pesos finales
+    (best_state), no necesariamente el último epoch ejecutado.
+    """
+    epochs = [h["epoch"] for h in history]
+    train_loss = [h["train_loss"] for h in history]
+    val_loss = [h["val_loss"] for h in history]
+    val_auc_pr = [h["val_auc_pr"] for h in history]
+    val_auc_roc = [h["val_auc_roc"] for h in history]
+
+    best_idx = max(range(len(history)), key=lambda i: val_auc_pr[i])
+    best_epoch = epochs[best_idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    axes[0].plot(epochs, train_loss, label="train_loss")
+    axes[0].plot(epochs, val_loss, label="val_loss")
+    axes[0].axvline(best_epoch, color="gray", linestyle="--", alpha=0.6,
+                     label=f"mejor epoch ({best_epoch})")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Loss de entrenamiento y validación")
+    axes[0].legend()
+
+    axes[1].plot(epochs, val_auc_pr, label="val_AUC-PR", color="tab:green")
+    axes[1].plot(epochs, val_auc_roc, label="val_AUC-ROC", color="tab:orange")
+    axes[1].axvline(best_epoch, color="gray", linestyle="--", alpha=0.6,
+                     label=f"mejor epoch ({best_epoch})")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Métrica")
+    axes[1].set_ylim(0, 1.05)
+    axes[1].set_title("Métricas de validación")
+    axes[1].legend()
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    plt.show()
+
+
+
+import json
+from pathlib import Path
+
+
+def train_multi_seed_and_save(
+    model_cls,
+    model_kwargs: dict,
+    best_params: dict,
+    dataloader_train,
+    dataloader_val,
+    pos_weight_raw: float,
+    seeds: list,
+    output_dir: str,
+    device: str = "cpu",
+    max_epochs: int = 100,
+    patience: int = 15,
+    scheduler_factor: float = 0.5,
+    scheduler_patience: int = 5,
+    clip_norm: float = 1.0,
+):
+    """
+    Reentrena la configuración ganadora sobre cada semilla en `seeds`,
+    persiste los pesos de la mejor época de cada una y su histórico.
+    Si las semillas coinciden con las usadas dentro del objective de
+    Optuna para ese mismo trial, el best_auc_pr de cada semilla aquí
+    debería reproducir casi exactamente el valor guardado en
+    trial.user_attrs["auc_pr_per_seed"]; si no coincide, hay una fuente
+    de aleatoriedad no controlada que conviene investigar antes de
+    confiar en los pesos exportados.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    resultados = []
+
+    for seed in seeds:
+        torch.manual_seed(seed)
+
+        model = model_cls(**model_kwargs)
+
+        model, history, best_auc_pr = train_with_early_stopping(
+            model=model,
+            dataloader_train=dataloader_train,
+            dataloader_val=dataloader_val,
+            pos_weight_raw=pos_weight_raw,
+            pw_factor=best_params["pw_factor"],
+            lr=best_params["lr"],
+            weight_decay=best_params["weight_decay"],
+            clip_norm=clip_norm,
+            max_epochs=max_epochs,
+            patience=patience,
+            scheduler_factor=scheduler_factor,
+            scheduler_patience=scheduler_patience,
+            device=device,
+            verbose=True,
         )
 
-    return {
-        "model": model,
-        "best_val_loss": best_val_loss,
-        "best_epoch": best_epoch,
-        "history": history,
-        "stopped_early": stopped_early,
-    }
+        weights_path = output_path / f"lstm_baseline_seed{seed}.pt"
+        history_path = output_path / f"history_seed{seed}.json"
+
+        torch.save(model.state_dict(), weights_path)
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        resultados.append({
+            "seed": seed,
+            "best_auc_pr": best_auc_pr,
+            "weights_path": str(weights_path),
+            "history_path": str(history_path),
+        })
+        print(f"Semilla {seed}: val_AUC-PR={best_auc_pr:.4f} -> {weights_path.name}")
+
+    metadata_path = output_path / "metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "best_params": best_params,
+            "model_kwargs": model_kwargs,
+            "pos_weight_raw": pos_weight_raw,
+            "seeds": seeds,
+            "resultados": resultados,
+        }, f, indent=2)
+
+    return resultados
+
+
+
+@torch.no_grad()
+def ensemble_predict(models: list, x: torch.Tensor) -> torch.Tensor:
+    """
+    Promedio aritmético de PROBABILIDADES, no de logits: sigmoid no es
+    lineal, así que promediar logits y aplicar sigmoid después no da el
+    mismo resultado que aplicar sigmoid por modelo y promediar después,
+    sobre todo cerca de la saturación. La fórmula que escribiste ya
+    especifica el orden correcto (sigma(logits) primero, promedio
+    después); esto es solo la implementación fiel de esa fórmula.
+    """
+    probs = torch.stack([torch.sigmoid(m(x)) for m in models], dim=0)
+    return probs.mean(dim=0)
+
+
+def load_ensemble(model_cls, model_kwargs: dict, weights_paths: list, device: str = "cpu"):
+    models = []
+    for path in weights_paths:
+        model = model_cls(**model_kwargs)
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.to(device)
+        model.eval()
+        models.append(model)
+    return models
+
+
+@torch.no_grad()
+def evaluate_ensemble(models: list, loader, device: str = "cpu"):
+    """
+    AUC-PR/AUC-ROC calculado sobre las probabilidades YA promediadas del
+    ensamble, no sobre el promedio de los AUC-PR individuales de cada
+    modelo. Esta es la métrica que caracteriza al LSTMBaseline final,
+    distinta de los tres escalares por semilla reportados hasta ahora.
+    """
+    all_probs, all_targets = [], []
+    for batch in loader:
+        x = batch["X"].to(device)
+        y = batch["failed"]
+        probs = ensemble_predict(models, x).cpu()
+        all_probs.append(probs)
+        all_targets.append(y)
+
+    probs = torch.cat(all_probs).numpy()
+    targets = torch.cat(all_targets).numpy()
+
+    auc_pr = average_precision_score(targets, probs)
+    auc_roc = roc_auc_score(targets, probs)
+    return auc_pr, auc_roc
+
