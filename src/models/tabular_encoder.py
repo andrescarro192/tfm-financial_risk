@@ -30,10 +30,11 @@ Decisiones de diseño documentadas
     dentro de los límites de VRAM de la T4 de Google Colab.
  
   Leakage causal acotado en evaluación (documentado, no un error)
-    A partir de 2023Q1, el contexto de 4 trimestres incluye trimestres del bloque
+    A partir de  2022Q2, el contexto de 4 trimestres incluye trimestres del bloque
     de evaluación con sus etiquetas reales. Esto es tolerable: un regulador en
-    2023Q1 sí conoce qué bancos quebraron en 2022. La tasa de positivos (~0.04%)
-    hace que la influencia sobre el espacio latente de TabPFN sea mínima.
+    2022Q2 sí conoce qué bancos quebraron en los trimestres previos. La tasa de 
+    positivos (~0.04%) hace que la influencia sobre el espacio latente de TabPFN 
+    sea mínima.
  
 Referencias
 -----------

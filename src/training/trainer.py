@@ -5,10 +5,10 @@ modelo concreto (reciben model como argumento). Reutilizables sin cambios
 para el Baseline y para el futuro Híbrido, ya que ambos comparten la
 misma arquitectura y el mismo protocolo de entrenamiento.
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score, brier_score_loss, precision_recall_curve
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -296,19 +296,6 @@ def train_multi_seed_and_save(
 
 
 
-@torch.no_grad()
-def ensemble_predict(models: list, x: torch.Tensor) -> torch.Tensor:
-    """
-    Promedio aritmético de PROBABILIDADES, no de logits: sigmoid no es
-    lineal, así que promediar logits y aplicar sigmoid después no da el
-    mismo resultado que aplicar sigmoid por modelo y promediar después,
-    sobre todo cerca de la saturación. La fórmula que escribiste ya
-    especifica el orden correcto (sigma(logits) primero, promedio
-    después); esto es solo la implementación fiel de esa fórmula.
-    """
-    probs = torch.stack([torch.sigmoid(m(x)) for m in models], dim=0)
-    return probs.mean(dim=0)
-
 
 def load_ensemble(model_cls, model_kwargs: dict, weights_paths: list, device: str = "cpu"):
     models = []
@@ -319,28 +306,4 @@ def load_ensemble(model_cls, model_kwargs: dict, weights_paths: list, device: st
         model.eval()
         models.append(model)
     return models
-
-
-@torch.no_grad()
-def evaluate_ensemble(models: list, loader, device: str = "cpu"):
-    """
-    AUC-PR/AUC-ROC calculado sobre las probabilidades YA promediadas del
-    ensamble, no sobre el promedio de los AUC-PR individuales de cada
-    modelo. Esta es la métrica que caracteriza al LSTMBaseline final,
-    distinta de los tres escalares por semilla reportados hasta ahora.
-    """
-    all_probs, all_targets = [], []
-    for batch in loader:
-        x = batch["X"].to(device)
-        y = batch["failed"]
-        probs = ensemble_predict(models, x).cpu()
-        all_probs.append(probs)
-        all_targets.append(y)
-
-    probs = torch.cat(all_probs).numpy()
-    targets = torch.cat(all_targets).numpy()
-
-    auc_pr = average_precision_score(targets, probs)
-    auc_roc = roc_auc_score(targets, probs)
-    return auc_pr, auc_roc
 
