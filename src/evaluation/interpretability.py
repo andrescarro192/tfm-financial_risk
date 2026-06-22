@@ -5,10 +5,25 @@ Módulo de interpretabilidad para el ensamble LSTM Baseline mediante GradientSHA
 
 Justificación del explainer:
     GradientSHAP calcula gradientes esperados sobre interpolaciones aleatorias
-    entre el input y el background. Es robusto ante las operaciones multiplicativas
-    de las puertas LSTM (problema documentado de DeepSHAP/DeepLIFT en arquitecturas
-    recurrentes). Opera sobre logits crudos (el forward del modelo no aplica sigmoid),
-    lo que garantiza gradientes no saturados y aditividad exacta en espacio log-odds.
+    entre el input y el background. A diferencia de DeepSHAP/DeepLIFT, que
+    sustituyen el backward estándar por reglas de atribución personalizadas
+    (problema documentado en arquitecturas recurrentes), GradientSHAP usa
+    autograd ordinario, por lo que no hereda ese problema con nn.LSTM. Opera
+    sobre logits crudos (el forward del modelo no aplica sigmoid), lo que
+    garantiza gradientes no saturados y aditividad exacta en espacio log-odds.
+
+    Nota de implementación — wrapper de salida:
+        shap.GradientExplainer asume internamente una salida 2D del modelo,
+        (batch, n_outputs), e indexa esa segunda dimensión. LSTMBaseline.forward
+        devuelve (batch,) tras un squeeze(-1) explícito, lo que provoca un
+        IndexError dentro de shap (_gradient.py, método gradient). Para no
+        modificar la arquitectura entrenada, se usa LSTMBaselineSHAPWrapper,
+        que delega el forward íntegro y solo añade unsqueeze(-1) para exponer
+        (batch, 1). Como consecuencia, shap_values() devuelve un array con una
+        dimensión final unitaria (N, 4, 192, 1) en vez de (N, 4, 192) directo;
+        compute_gradient_shap() la elimina con squeeze(-1) tras verificar ndim.
+        Verificado empíricamente en test_gradient_shap.py antes de aplicarse
+        sobre datos reales.
 
 Decisiones metodológicas fijadas:
     Background dataset:
@@ -203,9 +218,10 @@ def compute_gradient_shap(
     Los tensores se fuerzan a float32 internamente para garantizar compatibilidad
     con el LSTM independientemente del dtype de entrada.
 
-    El modelo devuelve un escalar por secuencia (logit crudo, sin sigmoid),
-    por lo que shap_values() devuelve directamente un array (N, 4, 192)
-    sin lista envolvente. Esto evita IndexError en modelos de salida escalar.
+    El modelo adaptado por el wrapper expone una salida (batch, 1), por lo que shap_values() 
+    puede devolver una lista o un array con una dimensión final unitaria (N, 4, 192, 1). 
+    El código incluye salvaguardas bi-direccionales para forzar siempre un array 
+    plano de forma (N, 4, 192). Esto evita IndexError en modelos de salida escalar.
 
     Para el análisis global se recomienda pasar inputs en batches o usar
     una muestra representativa (~1000-2000 secuencias) para evitar OOM.
@@ -247,11 +263,17 @@ def compute_gradient_shap(
 
         for start in range(0, n, batch_size):
             batch = inputs[start: start + batch_size]
-            # Salida escalar: shap_values devuelve (batch, 4, 192) directamente
             batch_shap = explainer.shap_values(batch, nsamples=n_samples)
-            # Salvaguarda por si alguna versión de shap devuelve lista
+            
+            # Salvaguarda 1: Por si alguna versión de shap devuelve lista
             if isinstance(batch_shap, list):
                 batch_shap = batch_shap[0]
+                
+            # Salvaguarda 2: contra la dimensión fantasma (N, 4, 192, 1) que añade
+            # GradientExplainer cuando el wrapper expone una salida (batch, 1).
+            if isinstance(batch_shap, np.ndarray) and batch_shap.ndim == 4 and batch_shap.shape[-1] == 1:
+                batch_shap = batch_shap.squeeze(-1)
+                
             model_shap.append(batch_shap)
 
         all_shap_values.append(np.concatenate(model_shap, axis=0))
