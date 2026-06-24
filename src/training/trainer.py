@@ -1,6 +1,6 @@
 # src/trainer.py
 """
-Funciones de entrenamiento, evaluación y early stopping, agnósticas al
+Funciones de entrenamiento, evaluación y early stopping del modelo LSTM, agnósticas al
 modelo concreto (reciben model como argumento). Reutilizables sin cambios
 para el Baseline y para el futuro Híbrido, ya que ambos comparten la
 misma arquitectura y el mismo protocolo de entrenamiento.
@@ -223,6 +223,7 @@ def train_multi_seed_and_save(
     pos_weight_raw: float,
     seeds: list,
     output_dir: str,
+    model_name: str = "lstm_baseline",  # <-- parametro nuevo
     device: str = "cpu",
     max_epochs: int = 100,
     patience: int = 15,
@@ -230,16 +231,6 @@ def train_multi_seed_and_save(
     scheduler_patience: int = 5,
     clip_norm: float = 1.0,
 ):
-    """
-    Reentrena la configuración ganadora sobre cada semilla en `seeds`,
-    persiste los pesos de la mejor época de cada una y su histórico.
-    Si las semillas coinciden con las usadas dentro del objective de
-    Optuna para ese mismo trial, el best_auc_pr de cada semilla aquí
-    debería reproducir casi exactamente el valor guardado en
-    trial.user_attrs["auc_pr_per_seed"]; si no coincide, hay una fuente
-    de aleatoriedad no controlada que conviene investigar antes de
-    confiar en los pesos exportados.
-    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -247,7 +238,6 @@ def train_multi_seed_and_save(
 
     for seed in seeds:
         torch.manual_seed(seed)
-
         model = model_cls(**model_kwargs)
 
         model, history, best_auc_pr = train_with_early_stopping(
@@ -267,8 +257,8 @@ def train_multi_seed_and_save(
             verbose=True,
         )
 
-        weights_path = output_path / f"lstm_baseline_seed{seed}.pt"
-        history_path = output_path / f"history_seed{seed}.json"
+        weights_path = output_path / f"{model_name}_seed{seed}.pt"
+        history_path = output_path / f"history_{model_name}_seed{seed}.json"
 
         torch.save(model.state_dict(), weights_path)
         with open(history_path, "w", encoding="utf-8") as f:
@@ -282,9 +272,10 @@ def train_multi_seed_and_save(
         })
         print(f"Semilla {seed}: val_AUC-PR={best_auc_pr:.4f} -> {weights_path.name}")
 
-    metadata_path = output_path / "metadata.json"
+    metadata_path = output_path / f"metadata_{model_name}.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump({
+            "model_name": model_name,
             "best_params": best_params,
             "model_kwargs": model_kwargs,
             "pos_weight_raw": pos_weight_raw,

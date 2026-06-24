@@ -227,47 +227,53 @@ class TGCN(nn.Module):
 
     def forward(self, snapshots: list) -> tuple:
         """
-        Procesa una secuencia de snapshots y devuelve logits y etiquetas
-        del último snapshot (el que se supervisa en cada paso de entrenamiento).
+        Procesa una secuencia de snapshots con alineación por CERT y
+        devuelve logits y etiquetas del último snapshot.
+
+        Cada snapshot debe tener .x, .edge_index, .y, .cert, .num_nodes
+        (formato producido por GraphBuilder). La matriz de adyacencia
+        densa se calcula aquí mismo a partir de edge_index — los
+        snapshots no almacenan .adj directamente (ver graph_builder.py).
+
+        Nodos que persisten entre snapshots consecutivos conservan su
+        estado oculto (alineado por CERT); nodos nuevos arrancan en cero.
+        Esto reproduce exactamente la lógica usada en entrenamiento
+        (notebook 06, Celda 8) y evaluación (evaluate, compute_val_loss).
 
         Args:
-            snapshots: lista de torch_geometric.data.Data, ordenados temporalmente.
-                       Cada elemento tiene:
-                         .x         (N_t, d_x)   atributos de nodo
-                         .adj       (N_t, N_t)   matriz de adyacencia densa
-                         .y         (N_t,)        etiquetas binarias
-                         .num_nodes int
+        snapshots: lista de torch_geometric.data.Data, ordenados
+                   temporalmente, cada uno con .cert (lista de CERTs
+                   en el mismo orden que .x).
 
         Returns:
-            logits: (N_T,)   logits del último snapshot (sin sigmoid)
-            y:      (N_T,)   etiquetas del último snapshot
+        logits: (N_T,)   logits del último snapshot (sin sigmoid)
+        y:      (N_T,)   etiquetas del último snapshot
         """
-        hidden_state = None
+        from torch_geometric.utils import to_dense_adj
+
+        cert_to_hidden = {}
 
         for snapshot in snapshots:
-            x   = snapshot.x                          # (N_t, d_x)
-            adj = snapshot.adj                        # (N_t, N_t)
-            n   = snapshot.num_nodes
+            x         = snapshot.x
+            cert_list = list(snapshot.cert)
 
-            # Inicializar o reinicializar hidden_state si N cambia entre snapshots.
-            # Cuando N_t ≠ N_{t-1} (quiebra o entrada de nuevos bancos), el estado
-            # oculto de nodos que ya no existen se descarta y los nuevos arrancan en 0.
-            # En la práctica se reconstruye el estado completo para N_t desde cero
-            # porque el mapping de índices entre trimestres está en meta_t, no aquí.
-            # El notebook 06 gestiona la alineación de nodos entre snapshots.
-            if hidden_state is None or hidden_state.size(0) != n:
-                hidden_state = torch.zeros(n, self.hidden_dim, device=x.device)
+            adj = to_dense_adj(
+                snapshot.edge_index, max_num_nodes=snapshot.num_nodes
+            ).squeeze(0).to(x.device)
 
-            # Laplaciano dinámico para este snapshot: O(N^2) pero N~5000, viable.
-            laplacian = calculate_laplacian(adj)      # (N_t, N_t)
+            hidden_state = torch.zeros(len(cert_list), self.hidden_dim, device=x.device)
+            for i, cert in enumerate(cert_list):
+                if cert in cert_to_hidden:
+                    hidden_state[i] = cert_to_hidden[cert]
 
-            # Un paso T-GCN
+            laplacian = calculate_laplacian(adj)
             hidden_state, _ = self.tgcn_cell(x, hidden_state, laplacian)
-            # hidden_state: (N_t, d_h)
 
-        # Cabeza clasificadora sobre el último snapshot
-        logits = self.classifier(hidden_state).squeeze(1)   # (N_T,)
-        y      = snapshots[-1].y                             # (N_T,)
+            for i, cert in enumerate(cert_list):
+                cert_to_hidden[cert] = hidden_state[i].detach()
+
+        logits = self.classifier(hidden_state).squeeze(1)
+        y      = snapshots[-1].y
 
         return logits, y
 

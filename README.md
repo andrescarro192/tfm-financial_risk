@@ -29,7 +29,6 @@ conda activate tfm-financial-risk
 tfm-financial_risk/
 ├── data/          # not tracked — place raw RIS files in data/dataraw/
 ├── src/           # source code (loader, models, anomaly, evaluation)
-├── experiments/   # training scripts and YAML configs
 ├── notebooks/     # EDA, feature engineering, results
 └── tests/         # unit tests
 ```

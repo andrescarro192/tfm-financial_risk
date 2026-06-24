@@ -126,9 +126,20 @@ class GraphBuilder:
     # Construcción de un snapshot individual
     # -------------------------------------------------------------------------
 
-    def build_snapshot(self, periodo: str) -> Optional[Data]:
+    def build_snapshot(self, periodo: str, embeddings: Optional[pd.DataFrame] = None) -> Optional[Data]:
         """
         Construye el snapshot Gt = (Vt, Et, Xt, At) para el trimestre t.
+
+        Args:
+            periodo:    Trimestre a construir, p.ej. '2016Q2'.
+            embeddings: DataFrame de embeddings a usar para este snapshot.
+                        Si None (por defecto), usa self.emb — el DataFrame
+                        pasado al constructor o fijado en fit(). Permite
+                        construir snapshots de un bloque distinto (p.ej.
+                        evaluación) sin mutar el estado del builder ni
+                        volver a llamar a fit(): los encoders y estadísticos
+                        de imputación ya ajustados se reutilizan tal cual,
+                        solo cambia la fuente de embeddings/periodo.
 
         Returns None si no hay embeddings para ese periodo.
 
@@ -138,8 +149,10 @@ class GraphBuilder:
         """
         assert self._fitted, "Llamar a fit() antes de build_snapshot()"
 
+        emb_source = embeddings if embeddings is not None else self.emb
+
         # ── 1. Vt: bancos con embedding en este trimestre ──────────────────
-        emb_t = self.emb[self.emb['period'] == periodo].copy()
+        emb_t = emb_source[emb_source['period'] == periodo].copy()
         if len(emb_t) == 0:
             return None
 
@@ -252,16 +265,49 @@ class GraphBuilder:
     # Construcción de todos los snapshots
     # -------------------------------------------------------------------------
 
-    def build_all(self, verbose: bool = True) -> list[Data]:
+    def build_all(
+        self,
+        verbose: bool = True,
+        embeddings: Optional[pd.DataFrame] = None,
+        periodos: Optional[list[str]] = None,
+    ) -> list[Data]:
         """
-        Construye la secuencia completa de snapshots para todos los periodos
+        Construye la secuencia completa de snapshots para los periodos
         disponibles en los embeddings.
+
+        Args:
+            verbose:    Si True, imprime una línea de resumen por snapshot.
+            embeddings: DataFrame de embeddings a usar. Si None, usa self.emb
+                        (el fijado en el constructor / fit()). Pasar un
+                        DataFrame distinto permite construir snapshots de
+                        otro bloque (p.ej. evaluación) reutilizando los
+                        encoders y estadísticos de imputación ya ajustados
+                        por fit(), sin mutar el estado del builder y sin
+                        volver a llamar a fit(). Esto es importante porque
+                        fit() debe verse el panel completo una sola vez
+                        para que la codificación sea consistente entre
+                        desarrollo y evaluación (mismo entero para la misma
+                        categoría en cualquier trimestre).
+            periodos:   Lista de periodos a construir. Si None, se derivan
+                        de los valores únicos de 'period' en `embeddings`
+                        (o self.emb si embeddings es None), ordenados.
+                        Permite limitar explícitamente el rango sin
+                        depender de qué periodos aparezcan en el DataFrame.
+
+        Returns:
+            Lista de objetos Data, uno por periodo con embeddings disponibles.
         """
         assert self._fitted, "Llamar a fit() antes de build_all()"
 
+        emb_source = embeddings if embeddings is not None else self.emb
+        periodos_a_construir = (
+            periodos if periodos is not None
+            else sorted(emb_source['period'].unique())
+        )
+
         snapshots = []
-        for periodo in self.periodos:
-            data = self.build_snapshot(periodo)
+        for periodo in periodos_a_construir:
+            data = self.build_snapshot(periodo, embeddings=emb_source)
             if data is None:
                 continue
             snapshots.append(data)
