@@ -223,7 +223,7 @@ def train_multi_seed_and_save(
     pos_weight_raw: float,
     seeds: list,
     output_dir: str,
-    model_name: str = "lstm_baseline",  # <-- parametro nuevo
+    model_name: str = "lstm_baseline",  
     device: str = "cpu",
     max_epochs: int = 100,
     patience: int = 15,
